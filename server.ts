@@ -1,16 +1,22 @@
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import cors from "cors";
 import fs from "fs";
+import { exec } from "child_process";
+import { promisify } from "util";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
-import { generateChatGPTImage, generateChatGPTText } from "./server/playwright";
 
+const execAsync = promisify(exec);
 const app = express();
 const PORT = 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
+
+// Serve the projects directory so the frontend can access downloaded mp3 and images
+app.use("/projects", express.static(path.resolve(process.cwd(), "projects")));
 
 // Lazy initializer for Gemini AI
 function getGenAI(): GoogleGenAI | null {
@@ -24,7 +30,57 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// 2. Song search endpoint (iTunes / LRCLIB fallback search)
+// Download audio and cover via yt-dlp
+app.post("/api/download-song", async (req, res) => {
+  try {
+    const { videoId, title, artists } = req.body;
+    if (!videoId || !title) {
+      return res.status(400).json({ error: "videoId and title are required" });
+    }
+
+    const safeTitle = title.replace(/[^a-zA-Z0-9_\-]/g, "_") || "Song";
+    const songDirName = `${safeTitle}_${videoId}`;
+    const projectPath = path.resolve(process.cwd(), "projects", songDirName);
+    
+    if (!fs.existsSync(projectPath)) {
+      fs.mkdirSync(projectPath, { recursive: true });
+    }
+
+    const ytdlpPath = process.env.YTDLP_PATH || "yt-dlp";
+    const audioPath = path.join(projectPath, "source.mp3");
+    
+    // yt-dlp commands for music.youtube.com
+    const youtubeUrl = `https://music.youtube.com/watch?v=${videoId}`;
+    
+    console.log(`Downloading audio for ${title} using yt-dlp...`);
+    await execAsync(`"${ytdlpPath}" -x --audio-format mp3 -o "${audioPath}" "${youtubeUrl}"`);
+    
+    console.log(`Downloading cover for ${title} using yt-dlp...`);
+    const coverPathPrefix = path.join(projectPath, "cover");
+    await execAsync(`"${ytdlpPath}" --write-thumbnail --skip-download -o "${coverPathPrefix}" "${youtubeUrl}"`);
+
+    // The thumbnail could have an unpredictable extension like .jpg or .webp
+    // Let's find the downloaded cover file
+    const files = fs.readdirSync(projectPath);
+    let coverFilename = files.find(f => f.startsWith("cover.") && (f.endsWith(".jpg") || f.endsWith(".webp") || f.endsWith(".png")));
+    
+    // Convert to absolute URL for frontend
+    const audioUrl = `/projects/${songDirName}/source.mp3`;
+    const coverUrl = coverFilename ? `/projects/${songDirName}/${coverFilename}` : "";
+
+    res.json({
+      success: true,
+      audioUrl,
+      coverUrl,
+      songDir: songDirName
+    });
+  } catch (error: any) {
+    console.error("Error downloading song via yt-dlp:", error);
+    res.status(500).json({ error: "Failed to download song", details: error.message });
+  }
+});
+
+// 2. Song search endpoint (yt-dlp search)
 app.get("/api/search", async (req, res) => {
   try {
     const query = String(req.query.q || "").trim();
@@ -32,35 +88,28 @@ app.get("/api/search", async (req, res) => {
       return res.status(400).json({ error: "Query parameter 'q' is required" });
     }
 
-    // Search iTunes Search API for high quality previews & covers
-    const itunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=10`;
-    const response = await fetch(itunesUrl);
-    const data = await response.json();
-
-    if (!data.results || data.results.length === 0) {
-      return res.json({ results: [], message: "No results found." });
-    }
-
-    const results = data.results.map((r: any) => {
-      const trackId = String(r.trackId);
-      const title = r.trackName || "Unknown Title";
-      const artists = r.artistName || "Unknown Artist";
-      let thumbUrl = r.artworkUrl100 || "";
-      if (thumbUrl) {
-        // Upgrade iTunes artwork resolution to 1080x1080
-        thumbUrl = thumbUrl.replace("100x100bb", "1080x1080bb");
+    const ytdlpPath = process.env.YTDLP_PATH || "yt-dlp";
+    console.log(`Searching for "${query}" using yt-dlp...`);
+    
+    // --dump-json prints one JSON object per line
+    const { stdout } = await execAsync(`"${ytdlpPath}" "ytsearch10:${query}" --dump-json --flat-playlist --default-search ytsearch`);
+    
+    const lines = stdout.split('\n').filter(line => line.trim());
+    const results = lines.map(line => {
+      try {
+        const item = JSON.parse(line);
+        return {
+          label: `${item.title} - ${item.channel} (${item.id})`,
+          videoId: item.id,
+          title: item.title,
+          artists: item.channel || item.uploader || "Unknown Artist",
+          thumbUrl: item.thumbnails?.[0]?.url || "",
+          audioUrl: "", // We will download it later
+        };
+      } catch (e) {
+        return null;
       }
-      const audioUrl = r.previewUrl || "";
-
-      return {
-        label: `${title} - ${artists} (${trackId})`,
-        videoId: trackId,
-        title,
-        artists,
-        thumbUrl,
-        audioUrl,
-      };
-    });
+    }).filter(Boolean);
 
     res.json({ results, message: `Found ${results.length} results.` });
   } catch (error: any) {
@@ -119,22 +168,78 @@ app.post("/api/generate-background", async (req, res) => {
       return res.status(400).json({ error: "Cover URL is required" });
     }
 
-    console.log("Generating background via ChatGPT...");
-
-    // Download cover to temp file
-    const coverRes = await fetch(coverUrl);
-    const buffer = await coverRes.arrayBuffer();
-    const tempPath = path.resolve(process.cwd(), `temp_cover_${Date.now()}.jpg`);
-    fs.writeFileSync(tempPath, Buffer.from(buffer));
-
-    try {
-      const dataUrl = await generateChatGPTImage(tempPath, prompt || "Generate a visually identical picture but 16:9, NO TEXT, gold highlights", title || "Cover");
-      res.json({ success: true, dataUrl });
-    } finally {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    console.log("Generating background via Gemini...");
+    const ai = getGenAI();
+    if (!ai) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not configured in .env" });
     }
+
+    // 1. Download cover to buffer
+    const isLocal = coverUrl.startsWith("/projects/");
+    let buffer: Buffer;
+    if (isLocal) {
+      const localPath = path.join(process.cwd(), coverUrl);
+      buffer = fs.readFileSync(localPath);
+    } else {
+      const coverRes = await fetch(coverUrl);
+      buffer = Buffer.from(await coverRes.arrayBuffer());
+    }
+    
+    // 2. Describe image using gemini-2.5-pro
+    console.log("Analyzing cover with Gemini Pro...");
+    const descriptionRes = await ai.models.generateContent({
+      model: "gemini-2.5-pro",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: "Describe this album cover in extreme detail (colors, mood, subjects, lighting, artistic style). I need this description to generate a visually identical 16:9 wallpaper. Keep it under 100 words." },
+            {
+              inlineData: {
+                data: buffer.toString("base64"),
+                mimeType: "image/jpeg"
+              }
+            }
+          ]
+        }
+      ]
+    });
+    
+    const coverDescription = descriptionRes.text;
+    console.log("Cover description:", coverDescription);
+
+    // 3. Generate image using Imagen 3
+    console.log("Generating 16:9 wallpaper with Imagen 3...");
+    const finalPrompt = `${prompt || "Generate a 16:9 wallpaper with no text"}. Base it on this description: ${coverDescription}`;
+    
+    const imageRes = await ai.models.generateImages({
+      model: "imagen-3.0-generate-002",
+      prompt: finalPrompt.substring(0, 480), // Keep prompt reasonable
+      config: {
+        numberOfImages: 1,
+        outputMimeType: "image/jpeg",
+        aspectRatio: "16:9"
+      }
+    });
+
+    const base64Image = imageRes.generatedImages[0].image.imageBytes;
+    const dataUrl = `data:image/jpeg;base64,${base64Image}`;
+    
+    // Save generated background to the project folder if we have a title
+    let savedUrl = dataUrl;
+    if (title && isLocal) {
+      const projectPath = path.dirname(path.join(process.cwd(), coverUrl));
+      if (fs.existsSync(projectPath)) {
+        const bgPath = path.join(projectPath, "background.jpg");
+        fs.writeFileSync(bgPath, Buffer.from(base64Image, 'base64'));
+        const songDirName = path.basename(projectPath);
+        savedUrl = `/projects/${songDirName}/background.jpg`;
+      }
+    }
+
+    res.json({ success: true, dataUrl: savedUrl });
   } catch (error: any) {
-    console.error("Error generating background:", error);
+    console.error("Error generating background via Gemini:", error);
     res.status(500).json({ error: "Failed to generate background", details: error.message });
   }
 });
@@ -200,30 +305,9 @@ Output format MUST be EXACTLY this structure with no markdown code blocks:
 [Your generated tags here]`;
 
     try {
-      console.log("Generating metadata via ChatGPT...");
-      const text = await generateChatGPTText(prompt);
-      
-      if (text.includes("===BODY===") && text.includes("===TAGS===")) {
-        const parts = text.split("===TAGS===");
-        const tags = parts[1].trim();
-        const body = parts[0].split("===BODY===")[1].trim();
-        const titleHeader = `${artist.toUpperCase()} – ${title.toUpperCase()} [Lyrics / Paroles] | ${artist} – ${title} (مع الكلمات)`;
-
-        return res.json({
-          titleHeader,
-          tags,
-          body,
-          source: "chatgpt",
-        });
-      }
-    } catch (chatgptErr: any) {
-      console.warn("ChatGPT metadata generation failed, trying Gemini or fallback:", chatgptErr.message);
-    }
-
-    const genAI = getGenAI();
-
-    if (genAI) {
-      try {
+      console.log("Generating metadata via Gemini...");
+      const genAI = getGenAI();
+      if (genAI) {
         const response = await genAI.models.generateContent({
           model: "gemini-2.5-flash",
           contents: prompt,
@@ -243,9 +327,9 @@ Output format MUST be EXACTLY this structure with no markdown code blocks:
             source: "gemini-ai",
           });
         }
-      } catch (aiErr) {
-        console.warn("Gemini API call failed, using fallback generator:", aiErr);
       }
+    } catch (aiErr: any) {
+      console.warn("Gemini metadata generation failed, trying fallback:", aiErr.message);
     }
 
     // Fallback template-based metadata generator
@@ -369,7 +453,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
