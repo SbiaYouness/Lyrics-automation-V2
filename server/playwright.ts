@@ -44,8 +44,12 @@ export async function generateChatGPTImage(
     await page.goto("https://chatgpt.com/");
 
     // Wait for the chat input
-    const chatInputSelector = 'div[id="prompt-textarea"], div[contenteditable="true"]';
-    await page.waitForSelector(chatInputSelector, { timeout: 30000 });
+    const chatInputSelector = '#prompt-textarea, textarea, div[contenteditable="true"]';
+    try {
+      await page.waitForSelector(chatInputSelector, { timeout: 30000 });
+    } catch (e) {
+      throw new Error("Could not find ChatGPT input. Are you logged in? Set PLAYWRIGHT_HEADLESS=false in your .env, run the server, and log in to ChatGPT first.");
+    }
 
     // Upload cover image
     const fileInput = await page.$('input[type="file"]');
@@ -110,8 +114,12 @@ export async function generateChatGPTText(prompt: string): Promise<string> {
     await page.goto("https://chatgpt.com/");
 
     // Wait for chat input
-    const chatInputSelector = 'div[id="prompt-textarea"], div[contenteditable="true"]';
-    await page.waitForSelector(chatInputSelector, { timeout: 30000 });
+    const chatInputSelector = '#prompt-textarea, textarea, div[contenteditable="true"]';
+    try {
+      await page.waitForSelector(chatInputSelector, { timeout: 30000 });
+    } catch (e) {
+      throw new Error("Could not find ChatGPT input. Are you logged in? Set PLAYWRIGHT_HEADLESS=false in your .env, run the server, and log in to ChatGPT first.");
+    }
 
     // Try to safely set innerHTML if fill doesn't work well for large text
     await page.evaluate((args) => {
