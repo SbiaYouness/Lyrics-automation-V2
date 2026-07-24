@@ -52,20 +52,32 @@ export const SongSource: React.FC<SongSourceProps> = ({
     }
 
     setDownloading(true);
-    setStatus(`Loading assets for: ${selectedResult.title}...`);
+    setStatus(`Downloading audio via yt-dlp for: ${selectedResult.title}...`);
 
     try {
-      // Create song directory name
-      const safeTitle = selectedResult.title.replace(/[^a-zA-Z0-9_-]/g, '_') || 'Song';
-      const songDir = `${safeTitle}_${selectedResult.videoId}`;
+      const res = await fetch("/api/download-song", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoId: selectedResult.videoId,
+          title: selectedResult.title,
+          artists: selectedResult.artists,
+        })
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to download song");
+      }
 
       const assets: SongAssets = {
         title: selectedResult.title,
         artists: selectedResult.artists,
         videoId: selectedResult.videoId,
-        audioUrl: selectedResult.audioUrl,
-        coverUrl: selectedResult.thumbUrl,
-        songDir,
+        audioUrl: data.audioUrl,
+        coverUrl: data.coverUrl || selectedResult.thumbUrl,
+        songDir: data.songDir,
       };
 
       onSongSelected(assets);

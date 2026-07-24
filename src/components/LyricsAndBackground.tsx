@@ -63,7 +63,7 @@ export const LyricsAndBackground: React.FC<LyricsAndBackgroundProps> = ({
     }
 
     setGeneratingBg(true);
-    setStatus('Generating 16:9 wallpaper composition with gold highlights using ChatGPT...');
+    setStatus('Generating 16:9 wallpaper composition with gold highlights using Gemini Imagen 3...');
 
     try {
       const res = await fetch('/api/generate-background', {
@@ -79,7 +79,7 @@ export const LyricsAndBackground: React.FC<LyricsAndBackgroundProps> = ({
       const data = await res.json();
       if (res.ok && data.success) {
         onBackgroundGenerated(data.dataUrl);
-        setStatus('Generated 16:9 wallpaper via ChatGPT successfully!');
+        setStatus('Generated 16:9 wallpaper via Gemini successfully!');
       } else {
         setStatus(`Error: ${data.error || 'Failed to generate background'}`);
       }
