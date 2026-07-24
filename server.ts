@@ -7,6 +7,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import { generateChatGPTImage, generateChatGPTText } from "./server/playwright";
 
 const execAsync = promisify(exec);
 const app = express();
@@ -168,78 +169,48 @@ app.post("/api/generate-background", async (req, res) => {
       return res.status(400).json({ error: "Cover URL is required" });
     }
 
-    console.log("Generating background via Gemini...");
-    const ai = getGenAI();
-    if (!ai) {
-      return res.status(500).json({ error: "GEMINI_API_KEY is not configured in .env" });
-    }
-
-    // 1. Download cover to buffer
+    console.log("Generating background via ChatGPT using Playwright...");
+    
     const isLocal = coverUrl.startsWith("/projects/");
-    let buffer: Buffer;
+    let tempPath = "";
+    let isTemp = false;
+
     if (isLocal) {
-      const localPath = path.join(process.cwd(), coverUrl);
-      buffer = fs.readFileSync(localPath);
+      tempPath = path.join(process.cwd(), coverUrl);
     } else {
       const coverRes = await fetch(coverUrl);
-      buffer = Buffer.from(await coverRes.arrayBuffer());
+      const buffer = Buffer.from(await coverRes.arrayBuffer());
+      tempPath = path.resolve(process.cwd(), `temp_cover_${Date.now()}.jpg`);
+      fs.writeFileSync(tempPath, buffer);
+      isTemp = true;
     }
-    
-    // 2. Describe image using gemini-2.5-pro
-    console.log("Analyzing cover with Gemini Pro...");
-    const descriptionRes = await ai.models.generateContent({
-      model: "gemini-2.5-pro",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: "Describe this album cover in extreme detail (colors, mood, subjects, lighting, artistic style). I need this description to generate a visually identical 16:9 wallpaper. Keep it under 100 words." },
-            {
-              inlineData: {
-                data: buffer.toString("base64"),
-                mimeType: "image/jpeg"
-              }
-            }
-          ]
+
+    try {
+      const dataUrl = await generateChatGPTImage(
+        tempPath, 
+        prompt || "Generate a visually identical picture but 16:9, NO TEXT, gold highlights", 
+        title || "Cover"
+      );
+      
+      // Save generated background to the project folder if it's local
+      let savedUrl = dataUrl;
+      if (title && isLocal) {
+        const projectPath = path.dirname(path.join(process.cwd(), coverUrl));
+        if (fs.existsSync(projectPath)) {
+          const base64Data = dataUrl.replace(/^data:image\/\w+;base64,/, "");
+          const bgPath = path.join(projectPath, "background.jpg");
+          fs.writeFileSync(bgPath, Buffer.from(base64Data, 'base64'));
+          const songDirName = path.basename(projectPath);
+          savedUrl = `/projects/${songDirName}/background.jpg`;
         }
-      ]
-    });
-    
-    const coverDescription = descriptionRes.text;
-    console.log("Cover description:", coverDescription);
-
-    // 3. Generate image using Imagen 3
-    console.log("Generating 16:9 wallpaper with Imagen 3...");
-    const finalPrompt = `${prompt || "Generate a 16:9 wallpaper with no text"}. Base it on this description: ${coverDescription}`;
-    
-    const imageRes = await ai.models.generateImages({
-      model: "imagen-3.0-generate-002",
-      prompt: finalPrompt.substring(0, 480), // Keep prompt reasonable
-      config: {
-        numberOfImages: 1,
-        outputMimeType: "image/jpeg",
-        aspectRatio: "16:9"
       }
-    });
 
-    const base64Image = imageRes.generatedImages[0].image.imageBytes;
-    const dataUrl = `data:image/jpeg;base64,${base64Image}`;
-    
-    // Save generated background to the project folder if we have a title
-    let savedUrl = dataUrl;
-    if (title && isLocal) {
-      const projectPath = path.dirname(path.join(process.cwd(), coverUrl));
-      if (fs.existsSync(projectPath)) {
-        const bgPath = path.join(projectPath, "background.jpg");
-        fs.writeFileSync(bgPath, Buffer.from(base64Image, 'base64'));
-        const songDirName = path.basename(projectPath);
-        savedUrl = `/projects/${songDirName}/background.jpg`;
-      }
+      res.json({ success: true, dataUrl: savedUrl });
+    } finally {
+      if (isTemp && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
     }
-
-    res.json({ success: true, dataUrl: savedUrl });
   } catch (error: any) {
-    console.error("Error generating background via Gemini:", error);
+    console.error("Error generating background via Playwright:", error);
     res.status(500).json({ error: "Failed to generate background", details: error.message });
   }
 });
@@ -305,31 +276,27 @@ Output format MUST be EXACTLY this structure with no markdown code blocks:
 [Your generated tags here]`;
 
     try {
-      console.log("Generating metadata via Gemini...");
-      const genAI = getGenAI();
-      if (genAI) {
-        const response = await genAI.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: prompt,
+      console.log("Generating metadata via ChatGPT with Playwright...");
+      const text = await generateChatGPTText(prompt);
+      
+      if (text.includes("===BODY===") && text.includes("===TAGS===")) {
+        const parts = text.split("===TAGS===");
+        const tags = parts[1].trim();
+        const body = parts[0].split("===BODY===")[1].trim();
+        const titleHeader = `${artist.toUpperCase()} – ${title.toUpperCase()} [Lyrics / Paroles] | ${artist} – ${title} (مع الكلمات)`;
+
+        return res.json({
+          titleHeader,
+          tags,
+          body,
+          source: "chatgpt",
         });
-
-        const text = response.text || "";
-        if (text.includes("===BODY===") && text.includes("===TAGS===")) {
-          const parts = text.split("===TAGS===");
-          const tags = parts[1].trim();
-          const body = parts[0].split("===BODY===")[1].trim();
-          const titleHeader = `${artist.toUpperCase()} – ${title.toUpperCase()} [Lyrics / Paroles] | ${artist} – ${title} (مع الكلمات)`;
-
-          return res.json({
-            titleHeader,
-            tags,
-            body,
-            source: "gemini-ai",
-          });
-        }
+      } else {
+        throw new Error("ChatGPT response did not match expected ===BODY=== and ===TAGS=== format.");
       }
-    } catch (aiErr: any) {
-      console.warn("Gemini metadata generation failed, trying fallback:", aiErr.message);
+    } catch (chatgptErr: any) {
+      console.warn("ChatGPT metadata generation failed, returning error:", chatgptErr.message);
+      return res.status(500).json({ error: "ChatGPT failed to generate metadata", details: chatgptErr.message });
     }
 
     // Fallback template-based metadata generator
