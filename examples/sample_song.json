@@ -1,0 +1,30 @@
+{
+  "song_title": "Sample Song",
+  "artist": "Sample Artist",
+  "slug": "sample-song",
+  "output_dir": "projects",
+  "audio": {
+    "type": "local_file",
+    "path": "C:/path/to/audio.mp3"
+  },
+  "cover": {
+    "type": "local_file",
+    "path": "C:/path/to/cover.jpg"
+  },
+  "lyrics": {
+    "source": "manual",
+    "text": "[Intro]\nLine one\nLine two\n[Verse 1]\nLine three"
+  },
+  "metadata_style": {
+    "title_template": "{artist} - {song_title} (Lyrics)",
+    "description_template": "Official-style lyrics video for {song_title} by {artist}.",
+    "tag_seed": ["lyrics", "official lyrics", "music"]
+  },
+  "canva": {
+    "enabled": true,
+    "template_id": "your-template-id"
+  },
+  "upload": {
+    "enabled": false
+  }
+}
